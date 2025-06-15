@@ -11,8 +11,6 @@ using ChannelIntersection.Models;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 
-// ReSharper disable InconsistentlySynchronizedField
-
 namespace ChannelIntersection
 {
     public class ChannelProcessor
@@ -35,6 +33,10 @@ namespace ChannelIntersection
         private const int MinViewers = 750;
         private const int MinAggregateChatters = 1000;
 
+        // BYPASS TO ONLY CHECK SOME CHANNELS 
+        private readonly bool _useCustomChannels = true; // Toggle this to enable bypass
+        private readonly List<string> _customChannelLogins = new() { "kaicenat", "2xrakai", "thetylilshow", "rayasianboy", "agent00", "duke", "pungaxdezz" };
+
         public ChannelProcessor(string psqlConnection, string twitchClient, string twitchToken)
         {
             _psqlConnection = psqlConnection;
@@ -52,9 +54,19 @@ namespace ChannelIntersection
             totalSw.Start();
 
             await GetFlags();
-            Console.WriteLine("retrieving channels");
-            await FetchChannels();
-            Console.WriteLine($"retrieved {_topChannels.Count} channels in {sw.Elapsed.TotalSeconds}s");
+
+            if (_useCustomChannels)
+            {
+                Console.WriteLine("bypass mode: using custom channel list");
+                await LoadCustomChannels();
+            }
+            else
+            {
+                Console.WriteLine("retrieving top channels");
+                await FetchChannels();
+                Console.WriteLine($"retrieved {_topChannels.Count} channels in {sw.Elapsed.TotalSeconds}s");
+            }
+
             sw.Restart();
 
             if (_flags.HasFlag(AggregateFlags.Hourly))
@@ -66,45 +78,36 @@ namespace ChannelIntersection
                 if (File.Exists(fileName))
                 {
                     await using FileStream fs = File.OpenRead(fileName);
-                    _chatters = await JsonSerializer.DeserializeAsync<Dictionary<string, HashSet<string>>>(fs) ?? new Dictionary<string, HashSet<string>>();
+                    _chatters = await JsonSerializer.DeserializeAsync<Dictionary<string, HashSet<string>>>(fs) ?? new();
                 }
                 else
                 {
-                    _chatters = new Dictionary<string, HashSet<string>>();
+                    _chatters = new();
                 }
-
-                sw.Restart();
 
                 int previousSize = _chatters.Count;
 
                 await Parallel.ForEachAsync(_topChannels, async (channel, token) =>
                 {
-                    (string _, Channel ch) = channel;
-                    await GetChatters(ch);
+                    await GetChatters(channel.Value);
                 });
 
                 Console.WriteLine($"retrieved {_halfHourlyChatters.Count:N0} chatters\nsaved {_chatters.Count:N0} chatters (+{_chatters.Count - previousSize:N0}) in {sw.Elapsed.TotalSeconds}s");
-                sw.Restart();
-
                 await File.WriteAllBytesAsync(fileName, JsonSerializer.SerializeToUtf8Bytes(_chatters));
             }
-            else // half hourly
+            else
             {
                 Console.WriteLine("beginning half hourly calculation");
                 await Parallel.ForEachAsync(_topChannels, async (channel, token) =>
                 {
-                    (string _, Channel ch) = channel;
-                    await GetChatters(ch);
+                    await GetChatters(channel.Value);
                 });
 
                 Console.WriteLine($"retrieved {_halfHourlyChatters.Count:N0} chatters in {sw.Elapsed.TotalSeconds}s");
-                sw.Restart();
             }
 
             var hh = new HalfHourly(_psqlConnection, _halfHourlyChatters, _topChannels, Timestamp);
             await hh.CalculateShared();
-            
-            // await hh.AddUserChannels();
 
             if (_flags.HasFlag(AggregateFlags.Daily))
             {
@@ -163,6 +166,7 @@ namespace ChannelIntersection
             var newChannels = new Dictionary<string, Channel>();
             var pageToken = string.Empty;
             await using var context = new TwitchContext(_psqlConnection);
+
             do
             {
                 using var request = new HttpRequestMessage();
@@ -177,8 +181,7 @@ namespace ChannelIntersection
                 {
                     using JsonDocument json = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
                     pageToken = json.RootElement.GetProperty("pagination").GetProperty("cursor").GetString();
-                    JsonElement.ArrayEnumerator channelEnumerator = json.RootElement.GetProperty("data").EnumerateArray();
-                    foreach (JsonElement channel in channelEnumerator)
+                    foreach (JsonElement channel in json.RootElement.GetProperty("data").EnumerateArray())
                     {
                         int viewerCount = channel.GetProperty("viewer_count").GetInt32();
                         if (viewerCount < MinViewers)
@@ -213,6 +216,30 @@ namespace ChannelIntersection
             return channels;
         }
 
+        private async Task LoadCustomChannels()
+        {
+            _topChannels = new Dictionary<string, Channel>();
+            await using var context = new TwitchContext(_psqlConnection);
+
+            foreach (string login in _customChannelLogins)
+            {
+                Channel dbChannel = await context.Channels.SingleOrDefaultAsync(x => x.LoginName == login);
+                if (dbChannel == null)
+                {
+                    dbChannel = new Channel(login, login, "Unknown", MinViewers + 1, Timestamp);
+                    await context.Channels.AddAsync(dbChannel);
+                }
+                else
+                {
+                    dbChannel.LastUpdate = Timestamp;
+                }
+
+                _topChannels.TryAdd(login, dbChannel);
+            }
+
+            await context.SaveChangesAsync();
+        }
+
         private async Task GetChannelAvatars(Dictionary<string, Channel> channels)
         {
             foreach (string reqString in Helper.RequestBuilder(channels.Keys))
@@ -223,11 +250,13 @@ namespace ChannelIntersection
                 request.RequestUri = new Uri($"https://api.twitch.tv/helix/users?{reqString}");
                 using HttpResponseMessage response = await Http.SendAsync(request);
                 using JsonDocument json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
-                JsonElement.ArrayEnumerator data = json.RootElement.GetProperty("data").EnumerateArray();
-                foreach (JsonElement channel in data)
+                foreach (JsonElement channel in json.RootElement.GetProperty("data").EnumerateArray())
                 {
                     Channel model = channels[channel.GetProperty("login").GetString()!.ToLowerInvariant()];
-                    if (model != null) model.Avatar = channel.GetProperty("profile_image_url").GetString()?.Replace("-300x300", "-70x70").Split('/')[4];
+                    if (model != null)
+                    {
+                        model.Avatar = channel.GetProperty("profile_image_url").GetString()?.Replace("-300x300", "-70x70").Split('/')[4];
+                    }
                 }
             }
         }
@@ -237,7 +266,7 @@ namespace ChannelIntersection
             Stream stream;
             try
             {
-                stream = await Http.GetStreamAsync($"https://tmi.twitch.tv/group/user/{channel.LoginName}/chatters");
+                stream = await Http.GetStreamAsync($"https://api.fuchsty.com/twitch/chatters/{channel.LoginName}");
             }
             catch
             {
@@ -248,26 +277,28 @@ namespace ChannelIntersection
             using JsonDocument response = await JsonDocument.ParseAsync(stream);
             await stream.DisposeAsync();
 
-            int chatters = response.RootElement.GetProperty("chatter_count").GetInt32();
+            int chatters = response.RootElement.GetProperty("count").GetInt32();
             if (chatters < MinChatters)
             {
                 return;
             }
 
             channel.Chatters = chatters;
+
+            JsonElement chattersRoot = response.RootElement.GetProperty("chatters");
+
             if (chatters >= MinAggregateChatters && _flags.HasFlag(AggregateFlags.Hourly))
             {
-                IterateHourly(channel, response.RootElement);
+                IterateHourly(channel, chattersRoot);
             }
             else
             {
-                IterateHalfHourly(channel, response.RootElement);
+                IterateHalfHourly(channel, chattersRoot);
             }
         }
-
-        private void IterateHalfHourly(Channel channel, JsonElement root)
+        private void IterateHalfHourly(Channel channel, JsonElement chattersRoot)
         {
-            JsonElement.ObjectEnumerator viewerTypes = root.GetProperty("chatters").EnumerateObject();
+            JsonElement.ObjectEnumerator viewerTypes = chattersRoot.EnumerateObject();
             foreach (JsonProperty viewerType in viewerTypes)
             {
                 foreach (JsonElement viewer in viewerType.Value.EnumerateArray())
@@ -282,7 +313,7 @@ namespace ChannelIntersection
                     {
                         if (!_halfHourlyChatters.ContainsKey(username))
                         {
-                            _halfHourlyChatters.TryAdd(username, new List<string> {channel.LoginName});
+                            _halfHourlyChatters.TryAdd(username, new List<string> { channel.LoginName });
                         }
                         else
                         {
@@ -292,10 +323,9 @@ namespace ChannelIntersection
                 }
             }
         }
-
-        private void IterateHourly(Channel channel, JsonElement root)
+        private void IterateHourly(Channel channel, JsonElement chattersRoot)
         {
-            JsonElement.ObjectEnumerator viewerTypes = root.GetProperty("chatters").EnumerateObject();
+            JsonElement.ObjectEnumerator viewerTypes = chattersRoot.EnumerateObject();
             foreach (JsonProperty viewerType in viewerTypes)
             {
                 foreach (JsonElement viewer in viewerType.Value.EnumerateArray())
@@ -310,7 +340,7 @@ namespace ChannelIntersection
                     {
                         if (!_chatters.ContainsKey(username))
                         {
-                            _chatters.TryAdd(username, new HashSet<string> {channel.LoginName});
+                            _chatters.TryAdd(username, new HashSet<string> { channel.LoginName });
                         }
                         else
                         {
@@ -322,7 +352,7 @@ namespace ChannelIntersection
                     {
                         if (!_halfHourlyChatters.ContainsKey(username))
                         {
-                            _halfHourlyChatters.TryAdd(username, new List<string> {channel.LoginName});
+                            _halfHourlyChatters.TryAdd(username, new List<string> { channel.LoginName });
                         }
                         else
                         {
@@ -332,5 +362,6 @@ namespace ChannelIntersection
                 }
             }
         }
+
     }
 }
