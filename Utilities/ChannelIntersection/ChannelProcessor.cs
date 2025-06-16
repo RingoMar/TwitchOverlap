@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Linq.Expressions;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text.Json;
@@ -29,13 +30,13 @@ namespace ChannelIntersection
         private static Dictionary<string, HashSet<string>> _chatters;
         private readonly Dictionary<string, List<string>> _halfHourlyChatters = new();
 
-        private const int MinChatters = 500;
-        private const int MinViewers = 750;
-        private const int MinAggregateChatters = 1000;
+        private const int MinChatters = 0;
+        private const int MinViewers = 0;
+        private const int MinAggregateChatters = 0;
 
         // BYPASS TO ONLY CHECK SOME CHANNELS 
         private readonly bool _useCustomChannels = true; // Toggle this to enable bypass
-        private readonly List<string> _customChannelLogins = new() { "kaicenat", "2xrakai", "thetylilshow", "rayasianboy", "agent00", "duke", "pungaxdezz" };
+        private readonly List<string> _customChannelLogins = new() { "kaicenat", "fanum", "2xrakai", "thetylilshow", "rayasianboy", "agent00", "duke", "pungaxdezz", "plaqueboymax", "silky", "adapt", "stableronaldo", "jasontheween", "lacy", "kaysan" };
 
         public ChannelProcessor(string psqlConnection, string twitchClient, string twitchToken)
         {
@@ -234,10 +235,41 @@ namespace ChannelIntersection
                     dbChannel.LastUpdate = Timestamp;
                 }
 
-                _topChannels.TryAdd(login, dbChannel);
+                _topChannels[login] = dbChannel;
             }
 
             await context.SaveChangesAsync();
+
+            await FetchCustomAvatars(_topChannels);
+        }
+
+        private async Task FetchCustomAvatars(Dictionary<string, Channel> channels)
+        {
+            foreach (string login in channels.Keys)
+            {
+                try
+                {
+                    var url = $"https://api.ivr.fi/v2/twitch/user?login={login}";
+                    using HttpRequestMessage request = new(HttpMethod.Get, url);
+                    request.Headers.UserAgent.ParseAdd("ChannelProcessorBot/1.0");
+
+                    using HttpResponseMessage response = await Http.SendAsync(request);
+                    if (!response.IsSuccessStatusCode) continue;
+
+                    using JsonDocument json = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
+                    JsonElement user = json.RootElement[0];
+                    string? logo = user.GetProperty("logo").GetString();
+
+                    if (!string.IsNullOrEmpty(logo) && channels.TryGetValue(login, out var channel))
+                    {
+                        channel.Avatar = logo;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error fetching logo for {login}: {ex.Message}");
+                }
+            }
         }
 
         private async Task GetChannelAvatars(Dictionary<string, Channel> channels)
