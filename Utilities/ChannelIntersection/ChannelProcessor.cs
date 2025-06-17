@@ -30,13 +30,13 @@ namespace ChannelIntersection
         private static Dictionary<string, HashSet<string>> _chatters;
         private readonly Dictionary<string, List<string>> _halfHourlyChatters = new();
 
-        private const int MinChatters = 0;
-        private const int MinViewers = 0;
+        private const int MinChatters = 60;
+        private const int MinViewers = 1000;
         private const int MinAggregateChatters = 0;
 
-        // BYPASS TO ONLY CHECK SOME CHANNELS 
-        private readonly bool _useCustomChannels = true; // Toggle this to enable bypass
-        private readonly List<string> _customChannelLogins = new() { "kaicenat", "fanum", "2xrakai", "thetylilshow", "rayasianboy", "agent00", "duke", "pungaxdezz", "plaqueboymax", "silky", "adapt", "stableronaldo", "jasontheween", "lacy", "kaysan" };
+        // BYPASS TO ONLY CHECK SOME CHANNELS
+        private readonly bool _useCustomChannels = true;  // Toggle this to enable bypass
+        private readonly List<string> _customChannelLogins = new() { };
 
         public ChannelProcessor(string psqlConnection, string twitchClient, string twitchToken)
         {
@@ -73,19 +73,26 @@ namespace ChannelIntersection
             if (_flags.HasFlag(AggregateFlags.Hourly))
             {
                 Console.WriteLine("beginning hourly calculation");
-                Directory.CreateDirectory("chatters");
-                var fileName = $"chatters/{Timestamp.Date.ToShortDateString()}.json";
+
+                // Create base directory if it doesn't exist
+                var datePart = Timestamp.Date;
+                var folderPath = Path.Combine("chatters", datePart.Month.ToString(), datePart.Day.ToString());
+                Directory.CreateDirectory(folderPath);
+
+                var fileName = Path.Combine(folderPath, $"{datePart.Year}.json");
 
                 if (File.Exists(fileName))
                 {
                     await using FileStream fs = File.OpenRead(fileName);
-                    _chatters = await JsonSerializer.DeserializeAsync<Dictionary<string, HashSet<string>>>(fs) ?? new();
+                    _chatters = await JsonSerializer.DeserializeAsync<Dictionary<string, HashSet<string>>>(fs)
+                               ?? new Dictionary<string, HashSet<string>>();
                 }
                 else
                 {
-                    _chatters = new();
+                    _chatters = new Dictionary<string, HashSet<string>>();
                 }
 
+                sw.Restart();
                 int previousSize = _chatters.Count;
 
                 await Parallel.ForEachAsync(_topChannels, async (channel, token) =>
@@ -94,17 +101,17 @@ namespace ChannelIntersection
                 });
 
                 Console.WriteLine($"retrieved {_halfHourlyChatters.Count:N0} chatters\nsaved {_chatters.Count:N0} chatters (+{_chatters.Count - previousSize:N0}) in {sw.Elapsed.TotalSeconds}s");
+
                 await File.WriteAllBytesAsync(fileName, JsonSerializer.SerializeToUtf8Bytes(_chatters));
+
             }
             else
             {
                 Console.WriteLine("beginning half hourly calculation");
-                await Parallel.ForEachAsync(_topChannels, async (channel, token) =>
-                {
-                    await GetChatters(channel.Value);
-                });
+                await Parallel.ForEachAsync(_topChannels, async (channel, token) => { await GetChatters(channel.Value); });
 
                 Console.WriteLine($"retrieved {_halfHourlyChatters.Count:N0} chatters in {sw.Elapsed.TotalSeconds}s");
+                sw.Restart();
             }
 
             var hh = new HalfHourly(_psqlConnection, _halfHourlyChatters, _topChannels, Timestamp);
@@ -173,9 +180,7 @@ namespace ChannelIntersection
                 using var request = new HttpRequestMessage();
                 request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _twitchToken);
                 request.Headers.Add("Client-Id", _twitchClient);
-                request.RequestUri = string.IsNullOrWhiteSpace(pageToken)
-                    ? new Uri("https://api.twitch.tv/helix/streams?first=100")
-                    : new Uri($"https://api.twitch.tv/helix/streams?first=100&after={pageToken}");
+                request.RequestUri = string.IsNullOrWhiteSpace(pageToken) ? new Uri("https://api.twitch.tv/helix/streams?first=100") : new Uri($"https://api.twitch.tv/helix/streams?first=100&after={pageToken}");
 
                 using HttpResponseMessage response = await Http.SendAsync(request);
                 if (response.IsSuccessStatusCode)
@@ -254,7 +259,8 @@ namespace ChannelIntersection
                     request.Headers.UserAgent.ParseAdd("ChannelProcessorBot/1.0");
 
                     using HttpResponseMessage response = await Http.SendAsync(request);
-                    if (!response.IsSuccessStatusCode) continue;
+                    if (!response.IsSuccessStatusCode)
+                        continue;
 
                     using JsonDocument json = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
                     JsonElement user = json.RootElement[0];
@@ -287,7 +293,7 @@ namespace ChannelIntersection
                     Channel model = channels[channel.GetProperty("login").GetString()!.ToLowerInvariant()];
                     if (model != null)
                     {
-                        model.Avatar = channel.GetProperty("profile_image_url").GetString()?.Replace("-300x300", "-70x70").Split('/')[4];
+                        model.Avatar = channel.GetProperty("profile_image_url").GetString()?.Replace("-300x300", "-70x70");
                     }
                 }
             }
@@ -394,6 +400,5 @@ namespace ChannelIntersection
                 }
             }
         }
-
     }
 }
